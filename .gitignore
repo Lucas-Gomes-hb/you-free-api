@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+env/
+.env
+
+# Logs
+*.log
+
+# Cookies (never commit authentication data)
+youfree_cookies.txt
+
+# OS
+.DS_Store
+Thumbs.db
