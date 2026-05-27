@@ -224,7 +224,8 @@ def _schedule_prefetch(video_ids: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 def _sync_search(query: str, offset: int = 0) -> dict:
-    count = 10 + offset
+    page_size = 20
+    count = page_size + offset
     ydl_opts = {
         **_base_opts(),
         'extract_flat': True,
@@ -236,7 +237,7 @@ def _sync_search(query: str, offset: int = 0) -> dict:
 
     videos = []
     if results and 'entries' in results:
-        for entry in results['entries'][offset:]:
+        for entry in results['entries'][offset:offset + page_size]:
             if not entry:
                 continue
             video_id = entry.get('id')
