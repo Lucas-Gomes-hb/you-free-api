@@ -241,7 +241,7 @@ def _sync_search(query: str, offset: int = 0) -> dict:
             if not entry:
                 continue
             video_id = entry.get('id')
-            if not video_id:
+            if not video_id or len(video_id) != 11:
                 continue
             videos.append({
                 'id': video_id,
@@ -256,11 +256,9 @@ def _sync_search(query: str, offset: int = 0) -> dict:
 
 def _sync_stream(video_id: str, fmt_req: str) -> dict:
     if fmt_req == "video":
-        ydl_opts = {
-            **_base_opts(),
-            'format': 'best[ext=mp4][height<=720]/best[ext=mp4]/best[height<=720]/best',
-            'extractor_args': {'youtube': {'player_client': ['web']}},
-        }
+        # No format selector: YouTube no longer offers progressive mp4 for most
+        # videos, and an unmatched selector aborts the whole extraction.
+        ydl_opts = _base_opts()
     else:
         ydl_opts = {
             **_base_opts(),
@@ -286,38 +284,36 @@ def _sync_stream(video_id: str, fmt_req: str) -> dict:
     }
 
     if fmt_req == "video":
-        # For merged DASH (bestvideo+bestaudio), the URL is in requested_formats
-        video_url = info.get('url')
-        if not video_url:
-            req_fmts = info.get('requested_formats') or []
-            for f in req_fmts:
-                if f.get('url') and f.get('vcodec') not in (None, 'none'):
-                    video_url = f['url']
-                    break
-        if not video_url:
-            # Last resort: search all formats for any combined mp4
-            all_fmt = info.get('formats', [])
-            candidates = sorted(
+        all_fmt = info.get('formats', [])
+
+        # Progressive mp4 (video+audio in a single URL) whenever it is still offered
+        def _combined(max_height: int) -> list:
+            return sorted(
                 [
                     f for f in all_fmt
                     if f.get('url')
                     and f.get('vcodec') not in (None, 'none')
                     and f.get('acodec') not in (None, 'none')
-                    and (f.get('height') or 9999) <= 720
+                    and f.get('ext') != 'mhtml'
+                    and (f.get('height') or 9999) <= max_height
                 ],
                 key=lambda f: f.get('height') or 0,
                 reverse=True,
             )
-            if not candidates:
-                candidates = sorted(
-                    [f for f in all_fmt if f.get('url') and f.get('vcodec') not in (None, 'none') and f.get('acodec') not in (None, 'none')],
-                    key=lambda f: f.get('height') or 0,
-                    reverse=True,
-                )
-            if candidates:
-                video_url = candidates[0]['url']
-        logger.info(f"Video URL resolved for {video_id}: {'OK' if video_url else 'NONE'}")
-        return {**base, 'formats': [], 'video_url': video_url}
+
+        candidates = _combined(720) or _combined(9999)
+        if candidates:
+            logger.info(f"Video URL resolved for {video_id}: progressive")
+            return {**base, 'formats': [], 'video_url': candidates[0]['url'],
+                    'video_format': 'progressive'}
+
+        # YouTube now serves adaptive streams only, where video and audio live in
+        # separate URLs. The HLS master manifest is the one URL that still carries
+        # both, so the player gets a single source it can play as-is.
+        manifest = next((f.get('manifest_url') for f in all_fmt if f.get('manifest_url')), None)
+        logger.info(f"Video URL resolved for {video_id}: {'hls' if manifest else 'NONE'}")
+        return {**base, 'formats': [], 'video_url': manifest,
+                'video_format': 'hls' if manifest else None}
 
     all_formats = info.get('formats', [])
     audio_formats = [
@@ -403,7 +399,9 @@ def _sync_suggestions_radio(video_id: str) -> dict:
         vid = entry.get('id')
         if not vid or vid == video_id:
             continue
-        videos.append(_build_video_entry(entry))
+        ve = _build_video_entry(entry)
+        if ve:
+            videos.append(ve)
         if len(videos) >= 20:
             break
     return {"results": videos, "count": len(videos)}
@@ -431,7 +429,9 @@ def _sync_suggestions_text(video_id: str, title: str, uploader: str) -> dict:
             if not _is_music_entry(entry):
                 continue
             seen_ids.add(vid)
-            videos.append(_build_video_entry(entry))
+            ve = _build_video_entry(entry)
+            if ve:
+                videos.append(ve)
             if len(videos) >= limit:
                 return
 
@@ -477,7 +477,9 @@ def _sync_home_feed() -> dict:
             for entry in ((info or {}).get('entries') or []):
                 if not entry:
                     continue
-                videos.append(_build_video_entry(entry))
+                ve = _build_video_entry(entry)
+                if ve:
+                    videos.append(ve)
         except Exception as e:
             logger.warning(f"RDMM home feed failed: {e}")
 
@@ -488,7 +490,9 @@ def _sync_home_feed() -> dict:
                 for entry in ((info or {}).get('entries') or []):
                     if not entry or not _is_music_entry(entry):
                         continue
-                    videos.append(_build_video_entry(entry))
+                    ve = _build_video_entry(entry)
+                    if ve:
+                        videos.append(ve)
             except Exception:
                 pass
 
@@ -497,7 +501,9 @@ def _sync_home_feed() -> dict:
             r = ydl.extract_info('ytsearch20:popular music hits', download=False)
             for entry in ((r or {}).get('entries') or []):
                 if entry:
-                    videos.append(_build_video_entry(entry))
+                    ve = _build_video_entry(entry)
+                    if ve:
+                        videos.append(ve)
 
     result = {"results": videos[:20], "count": min(len(videos), 20)}
     _home_feed_cache = result
@@ -520,7 +526,9 @@ def _sync_genre(hashtag: str) -> dict:
     for entry in ((info or {}).get('entries') or []):
         if not entry or not _is_music_entry(entry):
             continue
-        videos.append(_build_video_entry(entry))
+        ve = _build_video_entry(entry)
+        if ve:
+            videos.append(ve)
     return {"results": videos, "count": len(videos)}
 
 
@@ -539,11 +547,12 @@ def _sync_playlist(url: str) -> dict:
 
     playlist_type = 'album' if 'music.youtube.com' in url else 'playlist'
     uploader = info.get('uploader') or info.get('channel')
-    tracks = [
-        _build_video_entry(e, uploader)
-        for e in (info.get('entries') or [])
-        if e and e.get('id')
-    ]
+    tracks = []
+    for e in (info.get('entries') or []):
+        if e and e.get('id') and len(e['id']) == 11:
+            ve = _build_video_entry(e, uploader)
+            if ve:
+                tracks.append(ve)
     thumbnails = info.get('thumbnails') or []
     cover = thumbnails[-1].get('url') if thumbnails else (tracks[0]['thumbnail'] if tracks else None)
     return {
@@ -580,11 +589,12 @@ def _sync_channel(url: str) -> dict:
         raise ValueError("Canal não encontrado")
 
     uploader = info.get('uploader') or info.get('channel') or info.get('title')
-    videos = [
-        _build_video_entry(e, uploader)
-        for e in (info.get('entries') or [])
-        if e and e.get('id')
-    ]
+    videos = []
+    for e in (info.get('entries') or []):
+        if e and e.get('id') and len(e['id']) == 11:
+            ve = _build_video_entry(e, uploader)
+            if ve:
+                videos.append(ve)
     thumbnails = info.get('thumbnails') or []
     avatar = thumbnails[-1].get('url') if thumbnails else None
     return {
@@ -692,8 +702,10 @@ def _best_thumb(url: str | None, video_id: str | None) -> str | None:
     return url
 
 
-def _build_video_entry(entry: dict, fallback_uploader: str | None = None) -> dict:
+def _build_video_entry(entry: dict, fallback_uploader: str | None = None) -> dict | None:
     video_id = entry.get('id')
+    if not video_id or len(video_id) != 11:
+        return None
     return {
         'id': video_id,
         'title': entry.get('title'),
