@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import time
 import os
@@ -7,12 +8,15 @@ import urllib.parse
 import urllib.request
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 import yt_dlp
+
+import innertube
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,6 +24,24 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="YouFree API", version="1.0.0")
 
 _COOKIES_FILE = os.path.expanduser('~/youfree_cookies.txt')
+
+# Which experience the app is running as. 'music' keeps the music-only filter
+# (60s-12m, no podcast/tutorial titles); 'video' drops it entirely so a 1:1
+# YouTube is reachable. Carried per request in X-YouFree-Mode.
+#
+# A ContextVar, not a module global: this server is async, so two clients in
+# different modes would otherwise clobber each other mid-flight.
+_APP_MODE: ContextVar[str] = ContextVar('youfree_app_mode', default='music')
+
+
+@app.middleware('http')
+async def _bind_app_mode(request: Request, call_next):
+    mode = request.headers.get('x-youfree-mode', 'music')
+    token = _APP_MODE.set(mode if mode in ('music', 'video') else 'music')
+    try:
+        return await call_next(request)
+    finally:
+        _APP_MODE.reset(token)
 
 app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(
@@ -63,6 +85,21 @@ class CookiesRequest(BaseModel):
 
 class PrefetchRequest(BaseModel):
     video_ids: list[str]
+
+
+class VideoRequest(BaseModel):
+    video_id: str
+
+
+class CommentsRequest(BaseModel):
+    video_id: str
+    continuation: str | None = None
+    sort: str = "top"
+
+
+class RefinedSearchRequest(BaseModel):
+    query: str
+    params: str | None = None
 
 
 def _clean_lyrics_title(title: str, artist: str) -> tuple[str, str]:
@@ -238,7 +275,7 @@ def _sync_search(query: str, offset: int = 0) -> dict:
     videos = []
     if results and 'entries' in results:
         for entry in results['entries'][offset:offset + page_size]:
-            if not entry:
+            if not entry or not _keep(entry):
                 continue
             video_id = entry.get('id')
             if not video_id or len(video_id) != 11:
@@ -247,11 +284,341 @@ def _sync_search(query: str, offset: int = 0) -> dict:
                 'id': video_id,
                 'title': entry.get('title'),
                 'thumbnail': _best_thumb(entry.get('thumbnail'), video_id),
-                'duration': entry.get('duration'),
+                # Flat extraction leaves duration as a float and never fills
+                # view_count; normalising here keeps the payload shape identical
+                # to the InnerTube path so the client needs no special case.
+                'duration': innertube._duration(entry.get('duration')),
                 'uploader': entry.get('uploader') or entry.get('channel'),
                 'url': f"https://www.youtube.com/watch?v={video_id}",
+                'view_count': innertube.as_count(entry.get('view_count')),
+                'published_text': None,
+                'channel_thumbnail': None,
+                'badges': [],
             })
     return {"results": videos, "count": len(videos)}
+
+
+def _label_for_height(height: int | None) -> str:
+    return f"{height}p" if height else 'auto'
+
+
+def _codec_family(vcodec: str | None) -> str:
+    """Normalises a codec string to the family a DASH AdaptationSet is keyed on.
+
+    YouTube labels the same codec several ways across formats: `vp9` in webm,
+    `vp09.00.51.08` in mp4, `avc1.64002A` and `avc1.4d4020` for the two AVC
+    profiles. Those are all one family, and the level/constraint suffix is what
+    makes the device reject a rung — not the family.
+    """
+    if not vcodec:
+        return 'avc1'
+    head = vcodec.strip().lower().split('.')[0]
+    if head.startswith('avc'):
+        return 'avc1'
+    if head.startswith('vp9'):
+        return 'vp09'
+    if head.startswith('av01'):
+        return 'av01'
+    if head.startswith('hev') or head.startswith('hvc'):
+        return 'hvc1'
+    return head
+
+
+def _dash_mpd(duration: int, video: list, audio: list) -> str:
+    """Builds a DASH MPD out of YouTube's split adaptive streams.
+
+    YouTube serves video and audio as separate SegmentTemplate-less mp4 files,
+    so every Representation is a single BaseURL covering the whole asset. The
+    player needs a real manifest because that is the only way to reach 1080p+
+    *and* keep an audio track at the same time — a progressive mp4 stops at
+    720p, and a bare video-only stream plays silent.
+    """
+    total = max(1, int(duration or 1))
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-live:2011"'
+        ' type="static"'
+        f' mediaPresentationDuration="PT{total}S" minBufferTime="PT2S">',
+        '  <Period duration="PT%dS">' % total,
+    ]
+
+    # One AdaptationSet per (container, codec family) pair.
+    #
+    # A DASH AdaptationSet is one codec family by definition, and ExoPlayer
+    # builds a single video renderer from it. Folding the whole ladder into one
+    # set looks harmless but leaves the track selector holding rungs it cannot
+    # mix, and the result on device is no video renderer at all — the player
+    # keeps playing audio while the picture never appears. YouTube makes this
+    # unavoidable: 4K arrives as VP9/AV1 while 720p and below stay AVC, and both
+    # even live in the same mp4 container, so the container alone is not enough
+    # to separate them.
+    mime_for_ext = {
+        'mp4': 'video/mp4', 'm4v': 'video/mp4', 'mov': 'video/mp4',
+        'webm': 'video/webm', 'mkv': 'video/x-matroska',
+    }
+    video_groups: dict[tuple, list] = {}
+    for f in video:
+        key = (f.get('ext') or 'mp4', _codec_family(f.get('vcodec')))
+        video_groups.setdefault(key, []).append(f)
+
+
+    # Best family first, so the highest rung leads and the track selector's
+    # initial pick is the one the ladder is ordered around.
+    ordered_groups = sorted(
+        video_groups.items(),
+        key=lambda item: max(int(f.get('tbr') or 0) for f in item[1]),
+        reverse=True,
+    )
+
+    for group_index, ((ext, _family), group) in enumerate(ordered_groups):
+        mime = mime_for_ext.get(ext, 'video/mp4')
+        lines.append(
+            f'    <AdaptationSet id="{group_index}" mimeType="{mime}"'
+            ' segmentAlignment="true" startWithSAP="1">'
+        )
+        for i, f in enumerate(group):
+            h = f.get('height') or 0
+            w = f.get('width') or (h * 16 // 9 if h else 0)
+            bandwidth = int(f.get('tbr') or 0) * 1000 or 2000000
+            lines.append(
+                f'      <Representation id="v{group_index}_{i}"'
+                f' codecs="{f.get("vcodec") or "avc1.640028"}"'
+                f' width="{w}" height="{h}" frameRate="{int(f.get("fps") or 30)}"'
+                f' bandwidth="{bandwidth}" scalable="1">'
+            )
+            lines.append(f'        <BaseURL>{_xml_escape(f["url"])}</BaseURL>')
+            lines.extend(_single_segment(f['url'], total))
+            lines.append('      </Representation>')
+        lines.append('    </AdaptationSet>')
+
+    if audio:
+        audio_mime = 'audio/webm' if (audio[0].get('ext') == 'webm') else 'audio/mp4'
+        # AdaptationSet@id is xs:unsignedInt in the DASH schema, so it may not be
+        # a letter: ExoPlayer parses it with Long.parseLong and aborts the whole
+        # manifest on a non-numeric value.
+        lines.append(
+            f'    <AdaptationSet id="{len(video_groups)}" mimeType="{audio_mime}"'
+            ' segmentAlignment="true" startWithSAP="1">'
+        )
+        for i, f in enumerate(audio):
+            bandwidth = int(f.get('tbr') or 0) * 1000 or 128000
+            lines.append(
+                f'      <Representation id="a{i}" codecs="{f.get("acodec") or "mp4a.40.2"}"'
+                f' audioSamplingRate="{int(f.get("asr") or 44100)}"'
+                f' bandwidth="{bandwidth}" scalable="1">'
+            )
+            lines.append(f'        <BaseURL>{_xml_escape(f["url"])}</BaseURL>')
+            lines.extend(_single_segment(f['url'], total))
+            lines.append('      </Representation>')
+        lines.append('    </AdaptationSet>')
+
+    lines += ['  </Period>', '</MPD>', '']
+    return '\n'.join(lines)
+
+
+def _single_segment(url: str, total: int) -> list[str]:
+    """Describe one whole-file Representation as a single SegmentList entry.
+
+    Left as a bare <BaseURL>, the player has to guess how many bytes the
+    representation is from its bitrate and cuts the last moof/mdat short, which
+    surfaces as an EOFException out of the fragmented mp4 extractor: the audio
+    keeps playing, the video renderer never gets a sample. Naming the segment
+    explicitly hands the extractor an unbounded segment, so it reads the asset
+    to the end instead of to a computed length.
+    """
+    return [
+        f'        <SegmentList timescale="1" duration="{total}" startNumber="1">',
+        f'          <SegmentURL media="{_xml_escape(url)}" />',
+        '        </SegmentList>',
+    ]
+
+
+def _xml_escape(text: str) -> str:
+    return (text.replace('&', '&amp;').replace('<', '&lt;')
+                .replace('>', '&gt;').replace('"', '&quot;'))
+
+
+def _hls_rungs(all_fmt: list) -> tuple[str | None, list]:
+    """Finds the HLS master manifest plus the ladder the menu advertises.
+
+    YouTube lists every DASH rung twice: once as a progressive https file and
+    once as an `m3u8_native` entry pointing at HLS. Only the latter is
+    segmented, and a segmented source is the whole reason /hls exists — the
+    https files are one giant asset each, so ExoPlayer has no index to seek
+    inside and rewinds to byte zero. The master it hands over is already muxed
+    (`CODECS="avc1…,mp4a…"`), so one playlist per rung carries sound and
+    picture together and nothing has to be assembled here.
+
+    The ladder comes from the format list rather than the manifest: parsing the
+    master would mean a second round trip on every /stream, and the heights it
+    advertises are the same ones.
+    """
+    hls = [f for f in all_fmt if f.get('manifest_url') and (f.get('height') or 0) > 0]
+    if not hls:
+        return None, []
+
+    by_height: dict = {}
+    for f in sorted(
+        hls,
+        key=lambda f: (
+            f.get('height') or 0,
+            str(f.get('vcodec') or '').startswith('avc1'),
+            f.get('fps') or 0,
+        ),
+        reverse=True,
+    ):
+        h = f.get('height')
+        current = by_height.get(h)
+        if current is None or (
+            not str(current.get('vcodec') or '').startswith('avc1')
+            and str(f.get('vcodec') or '').startswith('avc1')
+        ):
+            by_height[h] = f
+
+    # Any rung's manifest_url resolves to the same master; the tallest one is
+    # the most likely to stay available.
+    master = max(hls, key=lambda f: f.get('height') or 0)['manifest_url']
+    ladder = [
+        {'label': _label_for_height(h), 'height': h, 'vcodec': f.get('vcodec')}
+        for h, f in sorted(by_height.items(), key=lambda kv: kv[0], reverse=True)
+    ]
+    return master, ladder
+
+
+def _sync_video_streams(all_fmt: list, info: dict) -> dict:
+    """Resolves the best playable video source plus the quality ladder.
+
+    Preference order:
+      1. DASH/MPD built from the adaptive split streams — only way to get 1080p+
+         with audio, and it lets the player switch quality without a re-fetch.
+      2. Progressive mp4, when YouTube still offers one.
+      3. The HLS master manifest, as a last resort.
+    """
+    def _has(f, *, video=True, audio=True) -> bool:
+        if not f.get('url') or f.get('ext') == 'mhtml':
+            return False
+        v = f.get('vcodec') not in (None, 'none')
+        a = f.get('acodec') not in (None, 'none')
+        return (v if video else not v) and (a if audio else not a)
+
+    # Adaptive splits: video-only ladder (mp4 first, so ExoPlayer gets one codec
+    # family) and the best audio-only track.
+    video_only = [f for f in all_fmt if _has(f, video=True, audio=False)]
+    video_only = [f for f in video_only if (f.get('height') or 0) > 0]
+    # Only direct media may back a DASH Representation. YouTube also lists every
+    # rung as an m3u8_native entry whose "url" is an HLS playlist, not a file:
+    # feeding that to the manifest makes the extractor read `#EXTM3U` as if it
+    # were an fMP4 atom header, which aborts with EOFException — audio survives
+    # and the picture never appears. The ladder is built from the https entries
+    # instead, which still carry AVC to 1080p and AV1/VP9 to 2160p.
+    video_only = [f for f in video_only if f.get('protocol') != 'm3u8_native']
+    # One entry per height. mp4/AVC is the safest family for ExoPlayer, but
+    # YouTube only ever offers 1080p+ as VP9/AV1 in webm, so mp4 is preferred
+    # per height rather than as a global filter — filtering globally would cap
+    # the whole ladder at 720p.
+    by_height: dict = {}
+    for f in sorted(
+        video_only,
+        key=lambda f: (f.get('height') or 0, f.get('ext') == 'mp4', f.get('fps') or 0),
+        reverse=True,
+    ):
+        h = f.get('height')
+        current = by_height.get(h)
+        if current is None or (
+            current.get('ext') != 'mp4' and f.get('ext') == 'mp4'
+        ):
+            by_height[h] = f
+    ladder = sorted(by_height.values(), key=lambda f: f.get('height') or 0, reverse=True)
+
+    audio_only = [f for f in all_fmt if _has(f, video=False, audio=True)]
+    m4a_audio = [f for f in audio_only if f.get('ext') == 'm4a'] or audio_only
+    audio_only = sorted(m4a_audio, key=lambda f: (f.get('abr') or f.get('tbr') or 0),
+                        reverse=True)[:1]
+
+    # The whole ladder, so the client can offer 480p/720p/1080p/1440p/2160p.
+    resolutions = [
+        {
+            'label': _label_for_height(f.get('height')),
+            'height': f.get('height'),
+            'url': f['url'],
+            'ext': f.get('ext'),
+            'filesize': f.get('filesize') or f.get('filesize_approx'),
+            'vcodec': f.get('vcodec'),
+            'is_video_only': True,
+        }
+        for f in ladder
+    ]
+
+    result = {
+        'formats': [],
+        'video_resolutions': resolutions,
+        'audio_url': audio_only[0]['url'] if audio_only else None,
+    }
+
+# DASH is still the better single source (one request per rung, one codec
+    # family), so it stays the default. The HLS master is what makes seeking
+    # cheap, because every rendition there is a list of short segments instead
+    # of one 2 GB asset; /hls proxies it.
+    hls_master, hls_ladder = _hls_rungs(all_fmt)
+    result['hls_master'] = hls_master
+    result['hls_ladder'] = hls_ladder
+
+    if ladder and audio_only:
+        video_id = info.get('id') or ''
+        result['video_url'] = f"/dash/{video_id}.mpd"
+        result['video_format'] = 'dash'
+        # Kept out of the JSON body: the manifest travels over HTTP and the
+        # player fetches it anyway. The `/dash` endpoint rebuilds it from these
+        # two lists, so one resolution serves every rung the menu offers.
+        result['dash_video'] = ladder
+        result['dash_audio'] = audio_only
+        result['duration'] = int(info.get('duration') or 0)
+        result['hls_url'] = f"/hls/{video_id}.m3u8" if hls_master else None
+        result['hls_resolutions'] = hls_ladder
+        logger.info(
+            f"Video URL resolved: dash, {len(resolutions)} qualities "
+            f"up to {ladder[0].get('height')}p, "
+            f"hls {'ready' if hls_master else 'unavailable'}"
+        )
+        return result
+
+    # Progressive mp4 (video+audio in a single URL) whenever it is still offered
+    def _combined(max_height: int) -> list:
+        return sorted(
+            [f for f in all_fmt if _has(f) and (f.get('height') or 9999) <= max_height],
+            key=lambda f: f.get('height') or 0,
+            reverse=True,
+        )
+
+    candidates = _combined(1080) or _combined(9999)
+    if candidates:
+        result['video_url'] = candidates[0]['url']
+        result['video_format'] = 'progressive'
+        result['video_resolutions'] = [
+            {
+                'label': _label_for_height(f.get('height')),
+                'height': f.get('height'),
+                'url': f['url'],
+                'ext': f.get('ext'),
+                'filesize': f.get('filesize') or f.get('filesize_approx'),
+                'is_video_only': False,
+            }
+            for f in sorted(candidates, key=lambda f: f.get('height') or 0, reverse=True)
+        ]
+        logger.info(f"Video URL resolved: progressive {candidates[0].get('height')}p")
+        return result
+
+    # YouTube now serves adaptive streams only. The HLS master manifest is the one
+    # URL that still carries both, so the player gets a single source as-is.
+    manifest = next(
+        (f.get('manifest_url') for f in all_fmt
+         if f.get('manifest_url') and (f.get('height') or 0) > 0),
+        None,
+    )
+    result['video_url'] = manifest
+    result['video_format'] = 'hls' if manifest else None
+    logger.info(f"Video URL resolved: {'hls' if manifest else 'NONE'}")
+    return result
 
 
 def _sync_stream(video_id: str, fmt_req: str) -> dict:
@@ -285,35 +652,7 @@ def _sync_stream(video_id: str, fmt_req: str) -> dict:
 
     if fmt_req == "video":
         all_fmt = info.get('formats', [])
-
-        # Progressive mp4 (video+audio in a single URL) whenever it is still offered
-        def _combined(max_height: int) -> list:
-            return sorted(
-                [
-                    f for f in all_fmt
-                    if f.get('url')
-                    and f.get('vcodec') not in (None, 'none')
-                    and f.get('acodec') not in (None, 'none')
-                    and f.get('ext') != 'mhtml'
-                    and (f.get('height') or 9999) <= max_height
-                ],
-                key=lambda f: f.get('height') or 0,
-                reverse=True,
-            )
-
-        candidates = _combined(720) or _combined(9999)
-        if candidates:
-            logger.info(f"Video URL resolved for {video_id}: progressive")
-            return {**base, 'formats': [], 'video_url': candidates[0]['url'],
-                    'video_format': 'progressive'}
-
-        # YouTube now serves adaptive streams only, where video and audio live in
-        # separate URLs. The HLS master manifest is the one URL that still carries
-        # both, so the player gets a single source it can play as-is.
-        manifest = next((f.get('manifest_url') for f in all_fmt if f.get('manifest_url')), None)
-        logger.info(f"Video URL resolved for {video_id}: {'hls' if manifest else 'NONE'}")
-        return {**base, 'formats': [], 'video_url': manifest,
-                'video_format': 'hls' if manifest else None}
+        return {**base, **_sync_video_streams(all_fmt, info)}
 
     all_formats = info.get('formats', [])
     audio_formats = [
@@ -371,6 +710,15 @@ def _is_music_entry(entry: dict) -> bool:
     return True
 
 
+def _keep(entry: dict) -> bool:
+    """Music-mode gate applied to every catalog response.
+
+    Video mode turns it off (see `app_mode`): a 1:1 YouTube needs long
+    lectures, streams and unlisted videos, all of which this filter drops.
+    """
+    return True if _APP_MODE.get() == 'video' else _is_music_entry(entry)
+
+
 def _extract_clean_artist(uploader: str) -> str | None:
     if not uploader:
         return None
@@ -426,7 +774,7 @@ def _sync_suggestions_text(video_id: str, title: str, uploader: str) -> dict:
             vid = entry.get('id')
             if not vid or vid in seen_ids:
                 continue
-            if not _is_music_entry(entry):
+            if not _keep(entry):
                 continue
             seen_ids.add(vid)
             ve = _build_video_entry(entry)
@@ -449,17 +797,18 @@ def _sync_suggestions_text(video_id: str, title: str, uploader: str) -> dict:
 # ---------------------------------------------------------------------------
 # Home feed cache — YouTube recommended videos (personalised via cookies)
 # ---------------------------------------------------------------------------
-_home_feed_cache: dict | None = None
-_home_feed_ts: float = 0
+# Keyed by app mode so switching modes never serves the other mode's feed.
+_home_feed_cache: dict[str, dict] = {}
+_home_feed_ts: dict[str, float] = {}
 _HOME_FEED_TTL = 2 * 3600
 
 
 def _sync_home_feed() -> dict:
-    global _home_feed_cache, _home_feed_ts
-
+    mode = _APP_MODE.get()
     now = time.monotonic()
-    if _home_feed_cache is not None and (now - _home_feed_ts) < _HOME_FEED_TTL:
-        return _home_feed_cache
+    cached = _home_feed_cache.get(mode)
+    if cached is not None and (now - _home_feed_ts.get(mode, 0.0)) < _HOME_FEED_TTL:
+        return cached
 
     ydl_opts = {
         **_base_opts(),
@@ -488,7 +837,7 @@ def _sync_home_feed() -> dict:
             try:
                 info = ydl.extract_info(':ytreccommended', download=False)
                 for entry in ((info or {}).get('entries') or []):
-                    if not entry or not _is_music_entry(entry):
+                    if not entry or not _keep(entry):
                         continue
                     ve = _build_video_entry(entry)
                     if ve:
@@ -506,8 +855,8 @@ def _sync_home_feed() -> dict:
                         videos.append(ve)
 
     result = {"results": videos[:20], "count": min(len(videos), 20)}
-    _home_feed_cache = result
-    _home_feed_ts = now
+    _home_feed_cache[mode] = result
+    _home_feed_ts[mode] = now
     return result
 
 
@@ -524,7 +873,7 @@ def _sync_genre(hashtag: str) -> dict:
         info = ydl.extract_info(url, download=False)
     videos: list = []
     for entry in ((info or {}).get('entries') or []):
-        if not entry or not _is_music_entry(entry):
+        if not entry or not _keep(entry):
             continue
         ve = _build_video_entry(entry)
         if ve:
@@ -749,19 +1098,221 @@ async def search(query: SearchQuery):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Kept in the cache for `/dash` and the HLS proxy to read, never sent to a
+# client: `mpd` is a whole manifest as a string, and `hls_master` is a signed
+# googlevideo URL the client has no use for once `/hls/{id}.m3u8` exists.
+_INTERNAL_STREAM_KEYS = ('mpd', 'hls_master', 'hls_ladder')
+
+
+def _public_stream(result: dict) -> dict:
+    return {k: v for k, v in result.items() if k not in _INTERNAL_STREAM_KEYS}
+
+
 @app.post("/stream")
 async def get_stream_url(request: StreamRequest):
     cached = _cache_get(request.video_id, request.format)
     if cached:
         logger.info(f"Stream cache hit: {request.video_id}")
-        return cached
+        return _public_stream(cached)
     try:
         result = await asyncio.to_thread(_sync_stream, request.video_id, request.format)
         _cache_set(request.video_id, result, request.format)
-        return result
+        return _public_stream(result)
     except Exception as e:
         logger.error(f"Stream error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dash/{video_id}.mpd")
+async def get_dash_manifest(video_id: str, height: int = 0):
+    """Serves the DASH manifest ExoPlayer needs to play 1080p+ with audio.
+
+    The manifest has to come from a real URL: ExoPlayer fetches the MPD and then
+    the segment ranges itself, so a string embedded in a JSON body is not an
+    option. Signed googlevideo URLs are embedded as BaseURL, so the player talks
+    to Google directly and this server stays out of the media path.
+
+    `height` narrows the manifest to a single video rung. Every rendition is a
+    whole fragmented file, so a DASH AdaptationSet has no per-segment timeline
+    to switch on: ExoPlayer re-reads the asset from byte zero when it changes
+    rungs, which on a two hour video is a stall long enough to look like a hang,
+    and its own initial pick is the lowest rung because the bandwidth estimate
+    starts at 200 kbps. Handing it exactly the rung that was asked for removes
+    the switch entirely, and the label the UI shows is then the truth.
+    """
+    cached = _cache_get(video_id, 'video')
+    if not (cached and cached.get('dash_video')):
+        try:
+            cached = await asyncio.to_thread(_sync_stream, video_id, 'video')
+        except Exception as e:
+            logger.error(f"DASH error for {video_id}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+        if not cached.get('dash_video'):
+            raise HTTPException(status_code=404, detail="No DASH manifest for this video")
+        _cache_set(video_id, cached, 'video')
+
+    video = cached['dash_video']
+    if height:
+        wanted = [f for f in video if (f.get('height') or 0) == height]
+        if not wanted:
+            raise HTTPException(status_code=404, detail=f"No {height}p rendition")
+        video = wanted
+    mpd = _dash_mpd(cached.get('duration') or 0, video, cached['dash_audio'])
+    return Response(content=mpd, media_type='application/dash+xml')
+
+
+def _proxy_host_ok(url: str) -> bool:
+    """The proxy is an open relay unless it only speaks to YouTube."""
+    try:
+        host = (urllib.parse.urlparse(url).hostname or '').lower()
+    except ValueError:
+        return False
+    return host == 'googlevideo.com' or host.endswith('.googlevideo.com')
+
+
+def _token(url: str) -> str:
+    return base64.urlsafe_b64encode(url.encode()).decode().rstrip('=')
+
+
+def _untoken(token: str) -> str:
+    padding = '=' * (-len(token) % 4)
+    return base64.urlsafe_b64decode(token + padding).decode()
+
+
+_URI_ATTR = re.compile(r'URI="([^"]*)"')
+
+
+def _rewrite_uris(text: str, path: str, video_id: str) -> str:
+    """Repoints every URI at this server, leaving the rest of the tags untouched.
+
+    Covers both URI lines and `URI="…"` attributes. The attribute form matters
+    in the master: YouTube's variants are video-only and their audio lives in
+    `#EXT-X-MEDIA` groups (`AUDIO="233"`), so a master without those entries
+    advertises `mp4a` in CODECS with no audio rendition behind it and ExoPlayer
+    fails with "Unable to bind a sample queue to TrackGroup audio/mp4a-latm".
+
+    Only googlevideo hosts are relinked; anything else is dropped instead of
+    becoming a relay for whatever a playlist happens to name.
+    """
+    out = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith('#'):
+            match = _URI_ATTR.search(line)
+            if match:
+                uri = match.group(1)
+                if uri.startswith('/hls/'):
+                    out.append(line)
+                elif _proxy_host_ok(uri):
+                    proxied = f"{path}/{video_id}?u={_token(uri)}"
+                    out.append(line[:match.start(1)] + proxied + line[match.end(1):])
+                else:
+                    logger.warning(f"HLS: refusing to proxy {uri[:80]}")
+                continue
+            out.append(line)
+            continue
+        if stripped.startswith('/hls/'):
+            out.append(line)
+            continue
+        if _proxy_host_ok(stripped):
+            out.append(f"{path}/{video_id}?u={_token(stripped)}")
+        else:
+            logger.warning(f"HLS: refusing to proxy {stripped[:80]}")
+    return '\n'.join(out) + '\n'
+
+
+async def _fetch_text(url: str) -> str:
+    def _get() -> str:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'YouFree/1.0',
+            'Accept': '*/*',
+        })
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read().decode('utf-8', 'replace')
+
+    return await asyncio.to_thread(_get)
+
+
+async def _hls_cache(video_id: str) -> dict:
+    """Resolves (and remembers) the HLS master for [video_id]."""
+    cached = _cache_get(video_id, 'video')
+    if not cached:
+        try:
+            cached = await asyncio.to_thread(_sync_stream, video_id, 'video')
+        except Exception as e:
+            logger.error(f"HLS error for {video_id}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+        _cache_set(video_id, cached, 'video')
+    if not cached.get('hls_master'):
+        raise HTTPException(status_code=404, detail="No HLS manifest for this video")
+    return cached
+
+
+@app.get("/hls/{video_id}.m3u8")
+async def get_hls_master(video_id: str):
+    """Proxies YouTube's HLS master so every rendition stays addressable.
+
+    This is the source that makes seeking usable. The DASH rungs are single
+    assets — 1080p on a long video runs past 2 GB with an empty `sidx`, so
+    ExoPlayer has no index and rewinds to byte zero on every jump, which reads
+    as a freeze. Here each rendition is a list of short segments, so a seek
+    fetches the one segment it lands on. The variants are video-only; their
+    audio is the `#EXT-X-MEDIA` groups, which are proxied like the variants.
+    """
+    cached = await _hls_cache(video_id)
+    text = await _fetch_text(cached['hls_master'])
+    return Response(
+        content=_rewrite_uris(text, '/hls/pl', video_id),
+        media_type='application/vnd.apple.mpegurl',
+    )
+
+
+@app.get("/hls/pl/{video_id}")
+async def get_hls_media_playlist(video_id: str, u: str):
+    """One rendition's playlist, with its segments repointed at /hls/seg."""
+    try:
+        url = _untoken(u)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Bad playlist token")
+    if not _proxy_host_ok(url):
+        raise HTTPException(status_code=403, detail="Playlist host not allowed")
+    text = await _fetch_text(url)
+    return Response(
+        content=_rewrite_uris(text, '/hls/seg', video_id),
+        media_type='application/vnd.apple.mpegurl',
+    )
+
+
+@app.get("/hls/seg/{video_id}")
+async def get_hls_segment(video_id: str, u: str):
+    """Streams one media segment.
+
+    A segment is a bounded range request, the one shape the tokenless CDN always
+    serves, so it is relayed as bytes.
+    """
+    try:
+        url = _untoken(u)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Bad segment token")
+    if not _proxy_host_ok(url):
+        raise HTTPException(status_code=403, detail="Segment host not allowed")
+
+    def _get() -> tuple[bytes, str]:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'YouFree/1.0',
+            'Accept': '*/*',
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read(), resp.headers.get('Content-Type') or 'video/mp2t'
+
+    try:
+        body, content_type = await asyncio.to_thread(_get)
+    except Exception as e:
+        logger.warning(f"HLS segment failed: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
+    return Response(content=body, media_type=content_type)
 
 
 @app.post("/suggestions")
@@ -933,6 +1484,123 @@ async def suggest(q: str = ""):
         return await asyncio.to_thread(_sync_suggest, q)
     except Exception:
         return {"suggestions": []}
+
+
+# ── Video mode ────────────────────────────────────────────────────────────────
+# yt-dlp does not expose the watch page's "up next" rail, its comments, or the
+# search refinement chips, so those come from InnerTube directly. Every call is
+# blocking HTTP, hence `asyncio.to_thread`, and the watch payloads are cached
+# because the watch page and its comments barely change.
+
+_watch_cache: dict[str, tuple[float, dict]] = {}
+_WATCH_TTL = 3600
+_comments_cache: dict[str, tuple[float, list]] = {}
+_COMMENTS_TTL = 900
+_related_cache: dict[str, tuple[float, list]] = {}
+_RELATED_TTL = 3600
+
+
+def _cached(store: dict, key: str, ttl: float):
+    entry = store.get(key)
+    if entry and (time.monotonic() - entry[0]) < ttl:
+        return entry[1]
+    return None
+
+
+def _store(store: dict, key: str, value) -> None:
+    store[key] = (time.monotonic(), value)
+    if len(store) > 200:
+        oldest = min(store.items(), key=lambda item: item[1][0])[0]
+        store.pop(oldest, None)
+
+
+@app.post("/video_details")
+async def video_details(request: VideoRequest):
+    video_id = request.video_id
+    if not (isinstance(video_id, str) and len(video_id) == 11):
+        raise HTTPException(status_code=400, detail="video_id inválido")
+    hit = _cached(_watch_cache, video_id, _WATCH_TTL)
+    if hit is not None:
+        return hit
+    try:
+        details = await asyncio.to_thread(innertube.video_details, video_id)
+    except Exception as e:
+        logger.error(f"video_details error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    if not details:
+        raise HTTPException(status_code=404, detail="Vídeo não encontrado")
+    _store(_watch_cache, video_id, details)
+    return details
+
+
+@app.post("/related")
+async def related(request: VideoRequest):
+    video_id = request.video_id
+    if not (isinstance(video_id, str) and len(video_id) == 11):
+        raise HTTPException(status_code=400, detail="video_id inválido")
+    hit = _cached(_related_cache, video_id, _RELATED_TTL)
+    if hit is not None:
+        return {"results": hit, "count": len(hit)}
+    try:
+        items = await asyncio.to_thread(innertube.related, video_id)
+    except Exception as e:
+        logger.error(f"related error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    _store(_related_cache, video_id, items)
+    return {"results": items, "count": len(items)}
+
+
+@app.post("/comments")
+async def comments(request: CommentsRequest):
+    video_id = request.video_id
+    if not (isinstance(video_id, str) and len(video_id) == 11):
+        raise HTTPException(status_code=400, detail="video_id inválido")
+
+    # Only the first, uncontinued page is cacheable: continuation tokens are
+    # single-use and tied to the exact paging position.
+    if not request.continuation:
+        hit = _cached(_comments_cache, f'{video_id}:{request.sort}', _COMMENTS_TTL)
+        if hit is not None:
+            return {"comments": hit, "continuation": None}
+    try:
+        page = await asyncio.to_thread(
+            innertube.comments, video_id, request.continuation, request.sort
+        )
+    except Exception as e:
+        logger.error(f"comments error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not request.continuation:
+        _store(_comments_cache, f'{video_id}:{request.sort}', page.get('comments', []))
+    return page
+
+
+@app.post("/search_videos")
+async def search_videos(request: RefinedSearchRequest):
+    try:
+        if not request.params:
+            # Unrefined search stays on yt-dlp, which resolves entries fully.
+            result = await asyncio.to_thread(_sync_search, request.query, 0)
+            return result
+        items = await asyncio.to_thread(
+            innertube.search_videos, request.query, request.params
+        )
+        return {"results": items, "count": len(items)}
+    except Exception as e:
+        logger.error(f"search_videos error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/search_filters")
+async def search_filters(request: RefinedSearchRequest):
+    try:
+        options = await asyncio.to_thread(
+            innertube.search_filters, request.query, request.params
+        )
+        return {"filters": options, "count": len(options)}
+    except Exception as e:
+        logger.error(f"search_filters error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
